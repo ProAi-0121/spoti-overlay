@@ -1,0 +1,6 @@
+PyQt5
+spotipy
+requests
+pyautogui
+keyboard
+python-dotenv

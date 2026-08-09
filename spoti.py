@@ -84,7 +84,7 @@ class ConfigDialog(QDialog):
         ok_button.clicked.connect(self.accept)
 
         layout.addWidget(ok_button)
-        self.setWindowIcon(QIcon('spoti.ico'))
+        self.setWindowIcon(QIcon('icon.ico'))
         self.setWindowFlag(Qt.WindowStaysOnTopHint)
 
         # Connect color pickers and slider to functions
