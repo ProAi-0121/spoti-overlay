@@ -36,12 +36,10 @@ The overlay stays on top of your other windows, is configurable in position, col
 
 Python dependencies (see `requirements.txt`):
 
-- `PyQt5`
-- `spotipy`
-- `requests`
+- `winsdk`
+- `Pillow`
 - `pyautogui`
 - `keyboard`
-- `python-dotenv`
 
 ## Installation
 

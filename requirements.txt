@@ -1,6 +1,4 @@
-PyQt5
-spotipy
-requests
+winsdk
+Pillow
 pyautogui
 keyboard
-python-dotenv

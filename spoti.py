@@ -1,381 +1,679 @@
-﻿import sys
-from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QMenu, QAction, QPushButton, QRadioButton, QButtonGroup, QDialog, QHBoxLayout, QColorDialog, QSlider, QLineEdit
-from PyQt5.QtGui import QFont, QPixmap, QPalette, QColor, QIcon
-from PyQt5.QtCore import QTimer, Qt, pyqtSignal
-import spotipy
-from spotipy.oauth2 import SpotifyOAuth
-import re
-import pyautogui
-import requests
-import keyboard
-import tkinter as tk
+"""
+Spoti Overlay v2
+================
+Frameless, always-on-top desktop widget that mirrors whatever media is playing
+(primarily Spotify) using the **Windows Media Session API** (winsdk) -- so no
+Spotify developer credentials are required.
+
+The settings window uses the image-based, frameless tkinter design from
+test.py (bag2.png background + example.png position buttons) and has been
+extended with background/font colors, opacity, overlay size, global hotkeys
+and click-through support.
+
+Controls
+--------
+* Left-click the overlay  -> toggle play / pause
+* Right-click the overlay -> context menu (next / previous / overlay / settings)
+* Global hotkeys (defaults, editable in Settings):
+    Alt+H          show / hide the overlay
+    Alt+O          toggle click-through (overlay mode)
+    Alt+Right      next track
+    Alt+Left       previous track
+"""
+
+import asyncio
+import ctypes
 import os
-from dotenv import load_dotenv
+import queue
+import re
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import colorchooser, font as tkfont
+from io import BytesIO
 
-load_dotenv()
+import keyboard
+import pyautogui
+from PIL import Image, ImageTk
+from winsdk.windows.media.control import (
+    GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+)
+from winsdk.windows.storage.streams import Buffer, InputStreamOptions
 
-class ColorButton(QPushButton):
-    def __init__(self, color, parent=None):
-        super(ColorButton, self).__init__(parent)
-        self.color = color
-        self.setAutoFillBackground(True)
-        self.setFixedWidth(50)
-        self.setFixedHeight(25)
-        self.update_color()
+# --------------------------------------------------------------------------- #
+#  Helpers / asset loading
+# --------------------------------------------------------------------------- #
+def resource_path(name):
+    """Return an absolute path to a bundled asset (works with PyInstaller)."""
+    base = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
+    return os.path.join(base, name)
 
-    def update_color(self):
-        palette = self.palette()
-        palette.setColor(QPalette.Button, self.color)
-        self.setPalette(palette)
+# Windows extended window style constants (used for the click-through overlay)
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
 
-class ConfigDialog(QDialog):
-    color_changed = pyqtSignal(QColor)
-    hotkey_changed = pyqtSignal(str)
 
-    def __init__(self, parent=None):
-        super(ConfigDialog, self).__init__(parent)
+# --------------------------------------------------------------------------- #
+#  Windows Media Session API (from Spoti-Wall.py)
+# --------------------------------------------------------------------------- #
+async def _get_media_info_async():
+    """Return now-playing info dict (or None) via the Windows media session."""
+    sessions = await MediaManager.request_async()
+    current = sessions.get_current_session()
+    if not current:
+        return None
 
-        self.setWindowTitle("PRO | Spoti")
-        self.setGeometry(0, 0, 300, 200)
-        self.move(QApplication.desktop().screen().rect().center() - self.rect().center())
+    try:
+        info = await current.try_get_media_properties_async()
+    except Exception:
+        return None
 
-        layout = QVBoxLayout(self)
+    title = (info.title or "").strip()
+    artist = (info.artist or "").strip()
+    if not title and not artist:
+        return None
 
-        # Position selection
-        position_label = QLabel("Select Position:")
-        top_left = QRadioButton("Top Left")
-        top_right = QRadioButton("Top Right")
-        down_left = QRadioButton("Down Left")
-        down_right = QRadioButton("Down Right")
-        self.position_group = QButtonGroup()
-        self.position_group.addButton(top_left)
-        self.position_group.addButton(top_right)
-        self.position_group.addButton(down_left)
-        self.position_group.addButton(down_right)
+    thumbnail = None
+    if info.thumbnail:
+        try:
+            stream_ref = await info.thumbnail.open_read_async()
+            content = await stream_ref.read_async(
+                Buffer(stream_ref.size),
+                stream_ref.size,
+                InputStreamOptions.READ_AHEAD,
+            )
+            thumbnail = bytes(content)
+        except Exception:
+            thumbnail = None
 
-        layout.addWidget(position_label)
-        layout.addWidget(top_left)
-        layout.addWidget(top_right)
-        layout.addWidget(down_left)
-        layout.addWidget(down_right)
+    playback = current.get_playback_info()
+    return {
+        "title": title,
+        "artist": artist,
+        "thumbnail": thumbnail,
+        "status": playback.playback_status,
+    }
 
-        # Color pickers
-        background_color_label = QLabel("Background Color:")
-        self.background_color_button = ColorButton(QColor(0, 0, 0))
-        font_color_label = QLabel("Font Color:")
-        self.font_color_button = ColorButton(QColor(255, 255, 255))
 
-        layout.addWidget(background_color_label)
-        layout.addWidget(self.background_color_button)
-        layout.addWidget(font_color_label)
-        layout.addWidget(self.font_color_button)
+def get_media_info():
+    """Synchronous wrapper around the async media-session lookup."""
+    try:
+        return asyncio.run(_get_media_info_async())
+    except Exception as e:
+        print(f"[Spoti] media lookup error: {e}")
+        return None
 
-        # Opacity slider
-        opacity_label = QLabel("Opacity:")
-        opacity_slider = QSlider(Qt.Horizontal)
-        opacity_slider.setMaximum(100)
-        opacity_slider.setValue(100)
+# --------------------------------------------------------------------------- #
+#  Overlay : the always-on-top now-playing widget
+# --------------------------------------------------------------------------- #
+class Overlay:
+    def __init__(self, root, config, on_settings):
+        self.root = root
+        self.config = config
+        self.on_settings = on_settings
+        self.win = None
+        self.photo = None
+        self.running = True
+        self.click_through = False
+        self._queue = queue.Queue()
+        self._build()
+        self._apply_position()
+        self._register_hotkeys()
+        threading.Thread(target=self._poll_loop, daemon=True).start()
+        self.root.after(100, self._tick)
 
-        layout.addWidget(opacity_label)
-        layout.addWidget(opacity_slider)
+    # -- UI construction ------------------------------------------------ #
+    def _build(self):
+        size = self.config["size"]
+        text_area = int(size * 0.55)
+        w, h = size, size + text_area
 
-        # OK button
-        ok_button = QPushButton("OK")
-        ok_button.clicked.connect(self.accept)
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.attributes("-alpha", self.config["opacity"])
+        win.configure(bg=self.config["bg_color"])
+        self.win = win
 
-        layout.addWidget(ok_button)
-        self.setWindowIcon(QIcon('icon.ico'))
-        self.setWindowFlag(Qt.WindowStaysOnTopHint)
+        canvas = tk.Canvas(
+            win,
+            width=w,
+            height=h,
+            bg=self.config["bg_color"],
+            highlightthickness=0,
+        )
+        canvas.pack()
+        self.canvas = canvas
 
-        # Connect color pickers and slider to functions
-        self.background_color_button.clicked.connect(self.pick_background_color)
-        self.font_color_button.clicked.connect(self.pick_font_color)
-        opacity_slider.valueChanged.connect(self.change_opacity)
+        self.album_id = canvas.create_image(0, 0, anchor="nw", image=None)
+        self.title_font = tkfont.Font(size=max(13, int(size * 0.08)))
+        self.artist_font = tkfont.Font(size=max(5, int(size * 0.05)))
+        self.title_id = canvas.create_text(
+            6, size + 2, anchor="nw", text="Loading..",
+            fill=self.config["font_color"],
+            font=self.title_font,
+        )
+        self.artist_id = canvas.create_text(
+            6, size + int(size * 0.18), anchor="nw", text="",
+            fill=self.config["font_color"],
+            font=self.artist_font,
+        )
 
-        # Initialize color variables
-        self.background_color = QColor(0, 0, 0)
-        self.font_color = QColor(255, 255, 255)
+        # whole overlay is interactive
+        canvas.bind("<Button-1>", self.toggle_play_pause)
+        canvas.bind("<Button-3>", self.show_menu)
 
-    def pick_background_color(self):
-        color = QColorDialog.getColor(self.background_color, self, "Select Background Color")
-        if color.isValid():
-            self.background_color = color
-            self.background_color_button.color = color
-            self.background_color_button.update_color()
-            self.color_changed.emit(color)
+    def _apply_position(self):
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        w = self.win.winfo_reqwidth()
+        h = self.win.winfo_reqheight()
+        pos = self.config["position"]
+        if pos == "Top Right":
+            x, y = sw - w + 35, 2
+        elif pos == "Bottom Left":
+            x, y = 2, sh - h - 97
+        elif pos == "Bottom Right":
+            x, y = sw - w + 35, sh - h - 97
+        else:  # Top Left (default)
+            x, y = 2, 2
+        self.win.geometry(f"+{x}+{y}")
 
-    def pick_font_color(self):
-        color = QColorDialog.getColor(self.font_color, self, "Select Font Color")
-        if color.isValid():
-            self.font_color = color
-            self.font_color_button.color = color
-            self.font_color_button.update_color()
-            self.color_changed.emit(color)
+    # -- media polling (background thread + main-thread tick) ------------ #
+    def _poll_loop(self):
+        while self.running:
+            info = get_media_info()
+            if info is not None:
+                self._queue.put(info)
+            time.sleep(self.config["refresh_ms"] / 1000.0)
 
-    def change_opacity(self, value):
-        opacity = value / 100.0
-        self.parent().setWindowOpacity(opacity)
+    def _tick(self):
+        if not self.running:
+            return
+        try:
+            while True:
+                info = self._queue.get_nowait()
+                if info is not None:
+                    self._display(info)
+        except queue.Empty:
+            pass
+        self.root.after(150, self._tick)
 
-class SpotifyNowPlayingApp(QWidget):
-    def __init__(self):
-        super(SpotifyNowPlayingApp, self).__init__()
-        self.setWindowTitle("Spoti")
-        self.config_dialog = ConfigDialog(self)
-        self.config_dialog.color_changed.connect(self.update_colors)
+    def _display(self, info):
+        title = info.get("title") or ""
+        artist = info.get("artist") or ""
 
-        if self.config_dialog.exec_() == QDialog.Rejected:
-            sys.exit()
+        if not title:
+            self.canvas.itemconfigure(self.title_id, text="No song playing")
+            self.canvas.itemconfigure(self.artist_id, text="")
+            self.canvas.itemconfigure(self.album_id, image="")
+            self.photo = None
+            return
 
-        self.apply_configurations()
+        title = re.split(r"[-(:]", title)[0].strip()
+        title = self._fit_text(
+            title, self.title_font, self.config["size"] - 12,
+            self.config.get("max_words", 5), 60,
+        )
+        artist = self._fit_text(
+            artist, self.artist_font, self.config["size"] - 12,
+            self.config.get("max_artist_words", 10), 90,
+        )
+        self.canvas.itemconfigure(self.title_id, text=title)
+        self.canvas.itemconfigure(
+            self.artist_id, text=("- " + artist) if artist else ""
+        )
 
-        # Set a custom font for the QLabel
-        self.font = QFont()
-        self.font.setPointSize(9)
+        thumb = info.get("thumbnail")
+        if thumb:
+            try:
+                img = Image.open(BytesIO(thumb)).convert("RGB")
+                img = img.resize((self.config["size"], self.config["size"]))
+                self.photo = ImageTk.PhotoImage(img)
+                self.canvas.itemconfigure(self.album_id, image=self.photo)
+                return
+            except Exception as e:
+                print(f"[Spoti] thumbnail error: {e}")
+        self.canvas.itemconfigure(self.album_id, image="")
+        self.photo = None
 
-        artist_font = QFont()
-        artist_font.setPointSize(7)
+    def _fit_text(self, text, font, max_width, max_words, max_chars):
+        """Truncate a string to a word limit that also fits in max_width px."""
+        ellipsis = "..."
+        text = (text or "").strip()
+        if not text:
+            return ""
+        words = text.split()
+        truncated = len(words) > max_words
+        if truncated:
+            text = " ".join(words[:max_words])
+        # shrink character-by-character until it fits (with ellipsis shown)
+        while font.measure(text + (ellipsis if truncated else "")) > max_width:
+            if not text:
+                break
+            text = text[:-1].rstrip()
+            truncated = True
+        out = text + (ellipsis if truncated else "")
+        # hard safety cap
+        if len(out) > max_chars:
+            out = out[:max_chars].rstrip() + ellipsis
+        return out
+    def toggle_play_pause(self, event=None):
+        pyautogui.press("playpause")
+        self._refresh()
 
-        # Add QLabel for displaying the album image
-        self.image_label = QLabel(self)
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setPixmap(QPixmap('default_image.png'))  # Replace with your default image
-
-        # Set up a clickable image
-        self.image_label.mousePressEvent = self.toggle_play_pause
-
-        self.label = QLabel("Loading..", self)
-        self.label.setFont(self.font)
-        self.label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-
-        self.artist_label = QLabel("", self)
-        self.artist_label.setFont(artist_font)
-        self.artist_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.image_label)
-        layout.addWidget(self.label)
-        layout.addWidget(self.artist_label)
-
-        # Set the window to always stay on top
-        self.setWindowFlag(Qt.WindowStaysOnTopHint)
-        self.setWindowFlag(Qt.FramelessWindowHint)
-        
-        self.click_through_enabled = False
-
-        # Set up a timer to update the song information every 5 seconds
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_song_info)
-        self.hotkey = "Alt+h"
-        self.timer.start(5000)
-        self.setWindowIcon(QIcon('icon.ico'))
-        # Initialize spotipy Spotify client using credentials from the environment (.env)
-        self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
-            client_id=os.getenv("SPOTIPY_CLIENT_ID"),
-            client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
-            redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
-            scope=os.getenv("SPOTIFY_SCOPE", "user-read-currently-playing user-read-playback-state user-modify-playback-state"),
-        ))
-        keyboard.add_hotkey(self.hotkey, self.toggle_hide_show)
-        keyboard.add_hotkey("Alt+Right", self.nexttrack)
-        keyboard.add_hotkey("Alt+Left", self.prevtrack)
-
-    def toggle_hide_show(self):
-        # Toggle the visibility of the window
-        self.setVisible(not self.isVisible())
-    def nexttrack(self):
+    def next_track(self):
         pyautogui.press("nexttrack")
-    def prevtrack(self):
+        self._refresh()
+
+    def prev_track(self):
         pyautogui.press("prevtrack")
+        self._refresh()
 
-    def apply_configurations(self):
-    # Apply position configuration
-      position_button = self.config_dialog.position_group.checkedButton()
+    def _refresh(self):
+        threading.Thread(
+            target=lambda: self._queue.put(get_media_info()), daemon=True
+        ).start()
 
-      if position_button is not None:
-        if position_button.text() == "Top Left":
-            self.setGeometry(0, 25, 100, 100)
-        elif position_button.text() == "Top Right":
-            screen_geometry = QApplication.desktop().screenGeometry()
-            self.setGeometry(screen_geometry.width() - 110, 24, 100, 100)
-        elif position_button.text() == "Down Left":
-            screen_geometry = QApplication.desktop().screenGeometry()
-            self.setGeometry(0, screen_geometry.height() - 125, 100, 100)
-        elif position_button.text() == "Down Right":
-            screen_geometry = QApplication.desktop().screenGeometry()
-            self.setGeometry(screen_geometry.width() - 110, screen_geometry.height() - 125, 100, 100)
-      else:
-        # Handle the case where no radio button is checked
-        print("No position selected. Using default position.")
+    def toggle_visible(self):
+        if self.win.state() == "withdrawn":
+            self.win.deiconify()
+        else:
+            self.win.withdraw()
 
-      # Apply background color and font color
-      palette = QPalette()
-      palette.setColor(QPalette.Window, self.config_dialog.background_color)
-      palette.setColor(QPalette.WindowText, self.config_dialog.font_color)
-      self.setPalette(palette)
-      
+    def toggle_click_through(self):
+        self.click_through = not self.click_through
+        self._set_layered(self.click_through)
 
-    def update_colors(self, color):
-        palette = QPalette()
-        palette.setColor(QPalette.Window, self.config_dialog.background_color)
-        palette.setColor(QPalette.WindowText, self.config_dialog.font_color)
-        self.setPalette(palette)
-    
-    def update_song_info(self):
+    def _set_layered(self, enable):
+        hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id())
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if enable:
+            style |= WS_EX_LAYERED | WS_EX_TRANSPARENT
+        else:
+            style &= ~(WS_EX_LAYERED | WS_EX_TRANSPARENT)
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+
+    # -- context menu ---------------------------------------------------- #
+    def show_menu(self, event):
+        menu = tk.Menu(self.win, tearoff=0)
+        menu.add_command(label="Next Track", command=self.next_track)
+        menu.add_command(label="Previous Track", command=self.prev_track)
+        menu.add_command(label="Play / Pause", command=self.toggle_play_pause)
+        menu.add_separator()
+        overlay_var = tk.BooleanVar(value=self.click_through)
+        menu.add_checkbutton(
+            label="Overlay (click-through)", variable=overlay_var,
+            command=self.toggle_click_through,
+        )
+        menu.add_separator()
+        menu.add_command(label="Settings", command=self.on_settings)
         try:
-            # Get the currently playing song from Spotify API
-            current_track = self.sp.current_playback()
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
-            if current_track is not None:
-                song_name = current_track['item']['name']
-                song_name = re.split(r'[-(:]', song_name)[0].strip()
-                artist_name = current_track['item']['artists'][0]['name']
+    # -- hotkeys --------------------------------------------------------- #
+    def _register_hotkeys(self):
+        keyboard.add_hotkey(
+            self.config.get("hotkey_show", "alt+h"), self.toggle_visible)
+        keyboard.add_hotkey(
+            self.config.get("hotkey_overlay", "alt+o"), self.toggle_click_through)
+        keyboard.add_hotkey(
+            self.config.get("hotkey_next", "alt+right"), self.next_track)
+        keyboard.add_hotkey(
+            self.config.get("hotkey_prev", "alt+left"), self.prev_track)
 
-                # Display song information
-                song_info = f" {song_name}"
-                self.label.setText(song_info)
-
-                # Display album image
-                album_image_url = current_track['item']['album']['images'][0]['url']
-                image_data = requests.get(album_image_url).content
-                pixmap = QPixmap()
-                pixmap.loadFromData(image_data)
-                self.image_label.setPixmap(pixmap.scaledToWidth(100))
-
-                # Display artist's name
-                self.artist_label.setText(f"-{artist_name}")
-
-                # Adjust the window size
-                self.setGeometry(self.geometry().x(), self.geometry().y(), 100, 100)
-
-            else:
-                self.label.setText("No song playing")
-                self.image_label.setPixmap(QPixmap('default_image.png'))  # Replace with your default image
-
-        except Exception as e:
-            print(f"Error: {e}")
-            self.label.setText("Error fetching song information")
-
-    def toggle_play_pause(self, event):
+    def _remove_hotkeys(self):
         try:
-            if event.button() == Qt.LeftButton:
-                # Toggle play/pause using pyautogui
-                pyautogui.press("playpause")  # Adjust the key based on your system
+            keyboard.unhook_all_hotkeys()
+        except Exception:
+            pass
 
-                # Update the display
-                self.update_song_info()
-            elif event.button() == Qt.RightButton:
-                # Show context menu for next, previous, and settings options
-                self.show_context_menu(event)
+    def close(self):
+        self.running = False
+        self._remove_hotkeys()
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+# --------------------------------------------------------------------------- #
+#  SettingsWindow : frameless, image-based configuration UI (test.py style)
+# --------------------------------------------------------------------------- #
+class SettingsWindow:
+    WIDTH, HEIGHT = 1000, 563
 
-        except Exception as e:
-            print(f"Error toggling play/pause: {e}")
+    def __init__(self, root, config, on_confirm):
+        self.root = root
+        self.config = dict(config)
+        self.on_confirm = on_confirm
 
-    def show_context_menu(self, event):
-        menu = QMenu(self)
-        next_action = menu.addAction("Next Track")
-        prev_action = menu.addAction("Previous Track")
-        click_through_action = menu.addAction("Overlay")
-        settings_action = menu.addAction("Settings")
+        self.win = tk.Toplevel(root)
+        self.win.title("PRO | Spoti")
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
 
-        # Check the menu item if click-through is enabled
-        click_through_action.setCheckable(True)
-        click_through_action.setChecked(self.click_through_enabled)
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        x = (sw - self.WIDTH) // 2
+        y = (sh - self.HEIGHT) // 2
+        self.win.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
 
-        action = menu.exec_(self.mapToGlobal(event.pos()))
-        if action == next_action:
-            # Trigger next track action
-            pyautogui.press("nexttrack")
-        elif action == prev_action:
-            # Trigger previous track action
-            pyautogui.press("prevtrack")
-        elif action == click_through_action:
-            # Toggle click-through state
-            self.click_through_enabled = not self.click_through_enabled
-            self.setWindowFlags(self.windowFlags() ^ Qt.WindowStaysOnTopHint)  # Toggle 'stay on top'
-            self.setWindowFlags(self.windowFlags() ^ Qt.FramelessWindowHint)  # Toggle 'frameless'
-            self.show()  # Show the changes
-        elif action == settings_action:
-            # Open settings dialog
-            self.config_dialog.show()
-
-class FramelessApp:
-    def __init__(self, master):
-        self.master = master
-        self.master.title("PRO | Spoti")
-        
-        # Set window dimensions
-        self.width = 1000
-        self.height = 563
-        
-        # Calculate center position
-        screen_width = self.master.winfo_screenwidth()
-        screen_height = self.master.winfo_screenheight()
-        x = (screen_width - self.width) // 2
-        y = (screen_height - self.height) // 2
-        
-        # Set window geometry
-        self.master.geometry(f"{self.width}x{self.height}+{x}+{y}")
-        
-        # Set window background
-        self.bg_image = tk.PhotoImage(file="bag2.png")
-        self.canvas = tk.Canvas(self.master, width=self.width, height=self.height)
+        self.bg = ImageTk.PhotoImage(
+            Image.open(resource_path("bag.png")).resize(
+                (self.WIDTH, self.HEIGHT)))
+        self.canvas = tk.Canvas(
+            self.win, width=self.WIDTH, height=self.HEIGHT, highlightthickness=0)
         self.canvas.pack()
-        self.canvas.create_image(0, 0, anchor="nw", image=self.bg_image)
-        
-        # Create image buttons
-        self.button_image = tk.PhotoImage(file="example.png").subsample(2)  # Adjust subsample factor as needed
-        
-        button_positions = [(27, 188), (27, 307), (275, 188), (275, 307)]  # Adjust button positions here
-        button_commands = [self.task1, self.task2, self.task3, self.task4]  # Assign tasks to buttons
-        
-        for button_position, command in zip(button_positions, button_commands):
-            button_x, button_y = button_position
-            button = tk.Button(self.master, image=self.button_image, bd=0, command=command, compound=tk.LEFT)
-            button_window = self.canvas.create_window(button_x, button_y, anchor="nw", window=button)
-        
-        # Keep window on top
-        self.master.attributes("-topmost", True)
-        
-        # Make window frameless
-        self.master.overrideredirect(True)
-        
-        # Bind events for dragging the window
-        self.canvas.bind("<ButtonPress-1>", self.start_move)
-        self.canvas.bind("<ButtonRelease-1>", self.stop_move)
-        self.canvas.bind("<B1-Motion>", self.on_motion)
-        
-    def start_move(self, event):
-        self.x = event.x
-        self.y = event.y
-        
-    def stop_move(self, event):
-        self.x = None
-        self.y = None
-        
-    def on_motion(self, event):
-        deltax = event.x - self.x
-        deltay = event.y - self.y
-        x = self.master.winfo_x() + deltax
-        y = self.master.winfo_y() + deltay
-        self.master.geometry(f"+{x}+{y}")
-        
-    def task1(self):
-        print("Task 1")
-        
-    def task2(self):
-        print("Task 2")
-        
-    def task3(self):
-        print("Task 3")
-        
-    def task4(self):
-        print("Task 4")
+        self.canvas.create_image(0, 0, anchor="nw", image=self.bg)
+
+        # draggable window (test.py behaviour) -- only on the empty canvas
+        self._drag_offset = None
+        self.canvas.bind("<ButtonPress-1>", self._start_move)
+        self.canvas.bind("<ButtonRelease-1>", self._stop_move)
+        self.canvas.bind("<B1-Motion>", self._on_motion)
+
+        # chosen position is shared with the position popup
+        self.position_var = tk.StringVar(value=self.config["position"])
+        self._build_options_panel()
+        self._build_close_button()
+
+    # -- window dragging ------------------------------------------------- #
+    def _start_move(self, event):
+        self._drag_offset = (event.x_root - self.win.winfo_x(),
+                             event.y_root - self.win.winfo_y())
+
+    def _stop_move(self, event):
+        self._drag_offset = None
+
+    def _on_motion(self, event):
+        if self._drag_offset is None:
+            return
+        ox, oy = self._drag_offset
+        self.win.geometry(f"+{event.x_root - ox}+{event.y_root - oy}")
+
+    # -- position selection popup ---------------------------------------- #
+    def _open_position_popup(self):
+        monitor = Image.open(resource_path("monitor.png"))
+        mw, mh = monitor.size
+        target_w = 760
+        scale = target_w / mw
+        pw, ph = int(mw * scale), int(mh * scale)
+        monitor_img = monitor.resize((pw, ph))
+
+        popup = tk.Toplevel(self.win)
+        popup.title("Choose Position")
+        popup.transient(self.win)
+        popup.attributes("-topmost", True)
+        popup.overrideredirect(True)
+
+        self._mon = ImageTk.PhotoImage(monitor_img)
+        cv = tk.Canvas(popup, width=pw, height=ph, highlightthickness=0)
+        cv.pack()
+        cv.create_image(0, 0, anchor="nw", image=self._mon)
+
+        btn_w, btn_h = 46, 65
+        self._pb_img = ImageTk.PhotoImage(
+            Image.open(resource_path("example.png")).resize((btn_w, btn_h)))
+        margin = 14
+        corners = [
+            ("Top Left", margin, margin),
+            ("Top Right", pw - btn_w - margin, margin),
+            ("Bottom Left", margin, ph - btn_h - margin),
+            ("Bottom Right", pw - btn_w - margin, ph - btn_h - margin),
+        ]
+        selected = self.position_var.get()
+        for name, x, y in corners:
+            b = tk.Button(
+                popup, image=self._pb_img, bd=0, relief="flat",
+                activebackground="#222222",
+                command=lambda n=name: self._pick_position(n, popup),
+            )
+            cv.create_window(x, y, anchor="nw", window=b)
+            if name == selected:
+                cv.create_rectangle(
+                    x - 5, y - 5, x + btn_w + 5, y + btn_h + 5,
+                    outline="#d71e1e", width=3)
+
+        popup.update_idletasks()
+        px = self.win.winfo_x() + (self.win.winfo_width() - pw) // 2
+        py = self.win.winfo_y() + (self.win.winfo_height() - ph) // 2
+        popup.geometry(f"{pw}x{ph}+{px}+{py}")
+
+        # modal: block the settings window until the popup is closed
+        popup.grab_set()
+        self.win.wait_window(popup)
+
+    def _pick_position(self, name, popup):
+        self.position_var.set(name)
+        self._refresh_position_label()
+        popup.destroy()
+# -- options panel (the "added more things") ------------------------- #
+    def _build_options_panel(self):
+        panel = tk.Frame(self.win, bg="#1b1b1b",
+                         highlightthickness=1, highlightbackground="#333333")
+        self.canvas.create_window(700, 150, anchor="nw", window=panel)
+        self._panel_row = 0
+
+        self.position_label = tk.Label(panel, text="", fg="#9f9f9f",
+                                       bg="#1b1b1b", font=tkfont.Font(size=9))
+        self.position_label.grid(row=self._next_row(), column=0, columnspan=3,
+                                 sticky="w", padx=12, pady=(0, 3))
+        pos_btn = tk.Button(
+            panel, text="Choose Position...", width=22, bd=0, relief="flat",
+            bg="#2a2a2a", fg="#ffffff", activebackground="#3a3a3a",
+            activeforeground="#ffffff", font=tkfont.Font(size=9),
+            command=self._open_position_popup,
+        )
+        pos_btn.grid(row=self._next_row(), column=0, columnspan=3,
+                     sticky="w", padx=12, pady=(0, 4))
+
+        self._add_section(panel, "APPEARANCE")
+        self.bg_swatch = tk.Canvas(panel, width=26, height=20,
+                                   bg=self.config["bg_color"],
+                                   highlightthickness=1,
+                                   highlightbackground="#555555")
+        self._add_color_row(panel, "Background color", self.bg_swatch,
+                            lambda: self._pick_color("bg_color", self.bg_swatch))
+        self.fg_swatch = tk.Canvas(panel, width=26, height=20,
+                                   bg=self.config["font_color"],
+                                   highlightthickness=1,
+                                   highlightbackground="#555555")
+        self._add_color_row(panel, "Font color", self.fg_swatch,
+                            lambda: self._pick_color("font_color", self.fg_swatch))
+        self.opacity_var = tk.IntVar(value=int(self.config["opacity"] * 100))
+        self._add_scaled_row(panel, "Opacity", self.opacity_var, 20, 100, " %")
+
+        self._add_section(panel, "OVERLAY")
+        self.size_var = tk.IntVar(value=self.config["size"])
+        self._add_scaled_row(panel, "Size", self.size_var, 120, 260, " px")
+        self.words_var = tk.IntVar(value=self.config.get("max_words", 5))
+        self._add_scaled_row(panel, "Title words", self.words_var, 2, 8, "")
+
+        self._add_section(panel, "HOTKEYS")
+        self.hot_show = tk.StringVar(value=self.config["hotkey_show"])
+        self.hot_overlay = tk.StringVar(value=self.config["hotkey_overlay"])
+        self.hot_next = tk.StringVar(value=self.config["hotkey_next"])
+        self.hot_prev = tk.StringVar(value=self.config["hotkey_prev"])
+        hotkey_btn = tk.Button(
+            panel, text="Edit Hotkeys", width=22, bd=0, relief="flat",
+            bg="#2a2a2a", fg="#ffffff", activebackground="#3a3a3a",
+            activeforeground="#ffffff", font=tkfont.Font(size=9),
+            command=self._open_hotkeys_popup,
+        )
+        hotkey_btn.grid(row=self._next_row(), column=0, columnspan=3,
+                        sticky="w", padx=12, pady=3)
+
+        self.ok_img = ImageTk.PhotoImage(
+            Image.open(resource_path("ok.png")).resize((120, 30)))
+        ok_btn = tk.Button(panel, image=self.ok_img, bd=0, relief="flat",
+                           command=self._confirm, activebackground="#ff0000")
+        ok_btn.image = self.ok_img
+        ok_btn.grid(row=self._next_row(), column=0, columnspan=3,
+                    padx=12, pady=(8, 10))
+
+        self._refresh_position_label()
+
+    def _next_row(self):
+        r = self._panel_row
+        self._panel_row += 1
+        return r
+
+    def _add_section(self, panel, title):
+        tk.Label(panel, text=title, fg="#1ed760", bg="#1b1b1b",
+                 font=tkfont.Font(size=9, weight="bold")
+                 ).grid(row=self._next_row(), column=0, columnspan=3,
+                        sticky="w", padx=12, pady=(5, 1))
+    def _add_color_row(self, panel, label, swatch, on_pick):
+        row = self._next_row()
+        tk.Label(panel, text=label, fg="#e6e6e6", bg="#1b1b1b", width=14,
+                 anchor="w", font=tkfont.Font(size=9),
+                 ).grid(row=row, column=0, sticky="w", padx=(12, 4), pady=1)
+        swatch.grid(row=row, column=1, sticky="w", padx=4, pady=1)
+        tk.Button(panel, text="Choose...", width=8, bd=0, relief="flat",
+                  bg="#2a2a2a", fg="#ffffff", activebackground="#3a3a3a",
+                  activeforeground="#ffffff", command=on_pick,
+                  ).grid(row=row, column=2, sticky="w", padx=(0, 10), pady=1)
+
+    def _add_scaled_row(self, panel, label, var, from_, to, suffix):
+        row = self._next_row()
+        inner = tk.Frame(panel, bg="#1b1b1b")
+        tk.Label(inner, text=label, fg="#e6e6e6", bg="#1b1b1b",
+                 font=tkfont.Font(size=9)).pack(side="left")
+        tk.Scale(inner, from_=from_, to=to, orient="horizontal", variable=var,
+                 showvalue=True, length=88, bg="#1b1b1b", fg="#ffffff",
+                 troughcolor="#2a2a2a", activebackground="#1ed760",
+                 highlightthickness=0, bd=0).pack(side="left", padx=(5, 0))
+        if suffix:
+            tk.Label(inner, text=suffix, fg="#9a9a9a", bg="#1b1b1b",
+                     font=tkfont.Font(size=9)).pack(side="left")
+        inner.grid(row=row, column=0, columnspan=3, sticky="w", padx=12, pady=1)
+
+    def _refresh_position_label(self):
+        try:
+            self.position_label.config(
+                text=f"Position: {self.position_var.get()}")
+        except Exception:
+            pass
+
+    def _pick_color(self, key, swatch):
+        chosen = colorchooser.askcolor(
+            color=self.config[key], title=f"Select {key}", parent=self.win)[1]
+        if chosen:
+            self.config[key] = chosen
+            swatch.config(bg=chosen)
+
+    def _confirm(self):
+        self.config.update({
+            "position": self.position_var.get(),
+            "opacity": self.opacity_var.get() / 100.0,
+            "size": self.size_var.get(),
+            "max_words": max(2, self.words_var.get()),
+            "hotkey_show": self.hot_show.get().strip() or "alt+h",
+            "hotkey_overlay": self.hot_overlay.get().strip() or "alt+o",
+            "hotkey_next": self.hot_next.get().strip() or "alt+right",
+            "hotkey_prev": self.hot_prev.get().strip() or "alt+left",
+        })
+        self.win.destroy()
+        self.on_confirm(self.config)
+    def _open_hotkeys_popup(self):
+        """Open a compact child dialog to edit the hotkey fields."""
+        popup = tk.Toplevel(self.win)
+        popup.title("Hotkeys")
+        popup.configure(bg="#1b1b1b")
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+
+        label_info = tk.Label(
+            popup, text="Hotkeys", fg="#d71e1e", bg="#1b1b1b",
+            font=tkfont.Font(size=12, weight="bold"))
+        label_info.grid(row=0, column=0, columnspan=2, sticky="w",
+                        padx=14, pady=(12, 4))
+
+        def row(r, text, var):
+            tk.Label(popup, text=text, fg="#e6e6e6", bg="#1b1b1b", width=14,
+                     anchor="w", font=tkfont.Font(size=9)
+                     ).grid(row=r, column=0, sticky="w", padx=(14, 6), pady=3)
+            tk.Entry(popup, textvariable=var, width=16, bg="#2a2a2a",
+                     fg="#ffffff", insertbackground="#ffffff", relief="flat"
+                     ).grid(row=r, column=1, sticky="w", padx=(0, 14), pady=3)
+
+        row(1, "Show / Hide", self.hot_show)
+        row(2, "Overlay", self.hot_overlay)
+        row(3, "Next track", self.hot_next)
+        row(4, "Prev track", self.hot_prev)
+
+        bot = tk.Frame(popup, bg="#1b1b1b")
+        bot.grid(row=5, column=0, columnspan=2, sticky="e", padx=14, pady=(8, 12))
+        tk.Button(bot, text="Done", width=8, bd=0, relief="flat", bg="#d71e1e",
+                  fg="#ffffff", activebackground="#b31212",
+                  activeforeground="#ffffff", command=popup.destroy,
+                  ).pack()
+
+        popup.update_idletasks()
+        w = popup.winfo_reqwidth()
+        h = popup.winfo_reqheight()
+        x = self.win.winfo_x() + (self.win.winfo_width() - w) // 2
+        y = self.win.winfo_y() + (self.win.winfo_height() - h) // 2
+        popup.geometry(f"{w}x{h}+{x}+{y}")
+# -- small top-right close button ------------------------------------ #
+    def _build_close_button(self):
+        close_btn = tk.Button(
+            self.win, text="x", fg="#ffffff", bg="#161616", bd=0,
+            font=tkfont.Font(size=13, weight="bold"),
+            activebackground="#ff3b30", activeforeground="#ffffff",
+            command=self._cancel,
+        )
+        self.canvas.create_window(
+            self.WIDTH - 30, 10, anchor="ne", window=close_btn)
+
+    def _cancel(self):
+        self.win.destroy()
+
+
+# --------------------------------------------------------------------------- #
+#  Controller : ties the settings window and the overlay together
+# --------------------------------------------------------------------------- #
+class SpotiApp:
+    DEFAULT_CONFIG = {
+        "position": "Top Left",
+        "bg_color": "#000000",
+        "font_color": "#ffffff",
+        "opacity": 1.0,
+        "size": 160,
+        "max_words": 5,
+        "hotkey_show": "alt+h",
+        "hotkey_overlay": "alt+o",
+        "hotkey_next": "alt+right",
+        "hotkey_prev": "alt+left",
+        "refresh_ms": 3000,
+    }
+
+    def __init__(self, root):
+        self.root = root
+        self.config = dict(self.DEFAULT_CONFIG)
+        self.overlay = None
+        self.show_settings()
+
+    def show_settings(self):
+        if self.overlay is not None:
+            self.overlay.close()
+            self.overlay = None
+        SettingsWindow(self.root, self.config, self.on_confirm)
+
+    def on_confirm(self, config):
+        self.config = config
+        self.overlay = Overlay(self.root, self.config, self.show_settings)
+
+
+def main():
+    root = tk.Tk()
+    root.withdraw()
+    app = SpotiApp(root)
+    root.mainloop()
+
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    #app = FramelessApp(root)
-    #root.mainloop()
-    app = QApplication(sys.argv)
-    window = SpotifyNowPlayingApp()
-    window.show()
-    sys.exit(app.exec_())
+    main()
