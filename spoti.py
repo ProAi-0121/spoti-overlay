@@ -117,6 +117,7 @@ class Overlay:
         self.photo = None
         self.running = True
         self.click_through = False
+        self.borderless = True
         self._queue = queue.Queue()
         self._build()
         self._apply_position()
@@ -129,6 +130,7 @@ class Overlay:
         size = self.config["size"]
         text_area = int(size * 0.55)
         w, h = size, size + text_area
+        self._w, self._h = w, h
 
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
@@ -168,8 +170,7 @@ class Overlay:
     def _apply_position(self):
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
-        w = self.win.winfo_reqwidth()
-        h = self.win.winfo_reqheight()
+        w, h = self._w, self._h
         pos = self.config["position"]
         if pos == "Top Right":
             x, y = sw - w + 35, 2
@@ -287,6 +288,17 @@ class Overlay:
         self.click_through = not self.click_through
         self._set_layered(self.click_through)
 
+    def toggle_borderless(self):
+        """Turn the window's OS frame/border on or off (default: frameless)."""
+        self.borderless = not self.borderless
+        self.win.overrideredirect(self.borderless)
+        self.win.update_idletasks()
+        # re-map so the border change takes effect on Windows
+        self.win.withdraw()
+        self.win.deiconify()
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-alpha", self.config["opacity"])
+
     def _set_layered(self, enable):
         hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id())
         style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
@@ -303,11 +315,7 @@ class Overlay:
         menu.add_command(label="Previous Track", command=self.prev_track)
         menu.add_command(label="Play / Pause", command=self.toggle_play_pause)
         menu.add_separator()
-        overlay_var = tk.BooleanVar(value=self.click_through)
-        menu.add_checkbutton(
-            label="Overlay (click-through)", variable=overlay_var,
-            command=self.toggle_click_through,
-        )
+        menu.add_command(label="Overlay Mode", command=self.toggle_borderless)
         menu.add_separator()
         menu.add_command(label="Settings", command=self.on_settings)
         try:
@@ -316,15 +324,19 @@ class Overlay:
             menu.grab_release()
 
     # -- hotkeys --------------------------------------------------------- #
+    def _bind(self, hotkey, cb):
+        """Register a hotkey, ignoring any that the keyboard lib can't parse."""
+        if hotkey:
+            try:
+                keyboard.add_hotkey(hotkey, cb)
+            except Exception as e:
+                print(f"[Spoti] ignored bad hotkey {hotkey!r}: {e}")
+
     def _register_hotkeys(self):
-        keyboard.add_hotkey(
-            self.config.get("hotkey_show", "alt+h"), self.toggle_visible)
-        keyboard.add_hotkey(
-            self.config.get("hotkey_overlay", "alt+o"), self.toggle_click_through)
-        keyboard.add_hotkey(
-            self.config.get("hotkey_next", "alt+right"), self.next_track)
-        keyboard.add_hotkey(
-            self.config.get("hotkey_prev", "alt+left"), self.prev_track)
+        self._bind(self.config.get("hotkey_show", "alt+h"), self.toggle_visible)
+        self._bind(self.config.get("hotkey_overlay"), self.toggle_click_through)
+        self._bind(self.config.get("hotkey_next", "alt+right"), self.next_track)
+        self._bind(self.config.get("hotkey_prev", "alt+left"), self.prev_track)
 
     def _remove_hotkeys(self):
         try:
@@ -343,7 +355,7 @@ class Overlay:
 #  SettingsWindow : frameless, image-based configuration UI (test.py style)
 # --------------------------------------------------------------------------- #
 class SettingsWindow:
-    WIDTH, HEIGHT = 1000, 563
+    WIDTH, HEIGHT = 1200, 700
 
     def __init__(self, root, config, on_confirm):
         self.root = root
@@ -362,12 +374,20 @@ class SettingsWindow:
         self.win.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
 
         self.bg = ImageTk.PhotoImage(
-            Image.open(resource_path("bag.png")).resize(
+            Image.open(resource_path("./assets/bag.png")).resize(
                 (self.WIDTH, self.HEIGHT)))
         self.canvas = tk.Canvas(
             self.win, width=self.WIDTH, height=self.HEIGHT, highlightthickness=0)
         self.canvas.pack()
         self.canvas.create_image(0, 0, anchor="nw", image=self.bg)
+
+        # top-center title
+        self.canvas.create_text(
+            self.WIDTH // 2 + 1, 40, text="S P O T I", anchor="n",
+            fill="#89EC7C", font=tkfont.Font(size=26, weight="bold"))
+        self.canvas.create_text(
+            self.WIDTH // 2, 37, text="S P O T I", anchor="n",
+            fill="#1ed760", font=tkfont.Font(size=26, weight="bold"))
 
         # draggable window (test.py behaviour) -- only on the empty canvas
         self._drag_offset = None
@@ -378,6 +398,7 @@ class SettingsWindow:
         # chosen position is shared with the position page
         self.position_var = tk.StringVar(value=self.config["position"])
         self.pos_page = None
+        self.settings_items = []
         self._build_options_panel()
         self._build_close_button()
 
@@ -396,15 +417,19 @@ class SettingsWindow:
         self.win.geometry(f"+{event.x_root - ox}+{event.y_root - oy}")
 
     # -- settings / position page switching --------------------------------- #
+    def _set_settings_visible(self, visible):
+        state = "normal" if visible else "hidden"
+        for iid in self.settings_items:
+            self.canvas.itemconfigure(iid, state=state)
+
     def _show_settings_page(self):
         if self.pos_page is not None:
             self.pos_page.place_forget()
-        self.canvas.itemconfigure(self.panel_win_id, state="normal")
+        self._set_settings_visible(True)
         self.canvas.itemconfigure(self.close_win_id, state="normal")
-        self.canvas.tag_raise(self.panel_win_id)
 
     def _show_position_page(self):
-        self.canvas.itemconfigure(self.panel_win_id, state="hidden")
+        self._set_settings_visible(False)
         self.canvas.itemconfigure(self.close_win_id, state="hidden")
         if self.pos_page is None:
             self._build_position_page()
@@ -412,7 +437,7 @@ class SettingsWindow:
 
     def _build_position_page(self):
         page = tk.Frame(self.win, bg="#000000")
-        monitor = Image.open(resource_path("monitor.png")).resize(
+        monitor = Image.open(resource_path("./assets/monitor.png")).resize(
             (self.WIDTH, self.HEIGHT))
         self._mon = ImageTk.PhotoImage(monitor)
         cv = tk.Canvas(page, width=self.WIDTH, height=self.HEIGHT,
@@ -420,9 +445,17 @@ class SettingsWindow:
         cv.pack(fill="both", expand=True)
         cv.create_image(0, 0, anchor="nw", image=self._mon)
 
+        # top-center title
+        cv.create_text(
+            self.WIDTH // 2 + 1, 41, text="CHOOSE POSITION", anchor="n",
+            fill="#000000", font=tkfont.Font(size=24, weight="bold"))
+        cv.create_text(
+            self.WIDTH // 2, 40, text="CHOOSE POSITION", anchor="n",
+            fill="#ffffff", font=tkfont.Font(size=24, weight="bold"))
+
         btn_w, btn_h = 46, 65
         self._pb_img = ImageTk.PhotoImage(
-            Image.open(resource_path("example.png")).resize((btn_w, btn_h)))
+            Image.open(resource_path("./assets/example.png")).resize((btn_w, btn_h)))
         m = 14
         corners = [
             ("Top Left", m, m),
@@ -444,9 +477,11 @@ class SettingsWindow:
                     outline="#d71e1e", width=3)
 
         back = tk.Button(
-            page, text="Back", bd=0, relief="flat", width=8,
+            page, text="Back", bd=0, relief="flat", width=14,
             bg="#2a2a2a", fg="#ffffff", activebackground="#3a3a3a",
-            activeforeground="#ffffff", command=self._show_settings_page)
+            activeforeground="#ffffff", pady=6,
+            font=tkfont.Font(size=12, weight="bold"),
+            command=self._show_settings_page)
         cv.create_window(
             self.WIDTH // 2 - 2, self.HEIGHT - 24, anchor="s", window=back)
 
@@ -456,107 +491,117 @@ class SettingsWindow:
         self.position_var.set(name)
         self._refresh_position_label()
         self._show_settings_page()
-# -- options panel (the "added more things") ------------------------- #
+    # -- options panel (controls placed straight on the background) ---------- #
+    # -- options panel: low-opacity rounded category cards ---------------- #
     def _build_options_panel(self):
-        panel = tk.Frame(self.win, bg="#1b1b1b",
-                         highlightthickness=1, highlightbackground="#333333")
-        self.panel_win_id = self.canvas.create_window(700, 150, anchor="nw",
-                                                      window=panel)
-        self._panel_row = 0
+        C = "#1a1a1a"
 
-        self.position_label = tk.Label(panel, text="", fg="#9f9f9f",
-                                       bg="#1b1b1b", font=tkfont.Font(size=9))
-        self.position_label.grid(row=self._next_row(), column=0, columnspan=3,
-                                 sticky="w", padx=12, pady=(0, 3))
-        pos_btn = tk.Button(
-            panel, text="Choose Position...", width=22, bd=0, relief="flat",
-            bg="#2a2a2a", fg="#ffffff", activebackground="#3a3a3a",
-            activeforeground="#ffffff", font=tkfont.Font(size=9),
-            command=self._show_position_page,
-        )
-        pos_btn.grid(row=self._next_row(), column=0, columnspan=3,
-                     sticky="w", padx=12, pady=(0, 4))
+        def place(w, x, y, anchor="w"):
+            self.settings_items.append(
+                self.canvas.create_window(x, y, anchor=anchor, window=w))
 
-        self._add_section(panel, "APPEARANCE")
-        self.bg_swatch = tk.Canvas(panel, width=26, height=20,
-                                   bg=self.config["bg_color"],
-                                   highlightthickness=1,
-                                   highlightbackground="#555555")
-        self._add_color_row(panel, "Background color", self.bg_swatch,
-                            lambda: self._pick_color("bg_color", self.bg_swatch))
-        self.fg_swatch = tk.Canvas(panel, width=26, height=20,
-                                   bg=self.config["font_color"],
-                                   highlightthickness=1,
-                                   highlightbackground="#555555")
-        self._add_color_row(panel, "Font color", self.fg_swatch,
-                            lambda: self._pick_color("font_color", self.fg_swatch))
+        def card(x1, y1, x2, y2, r=20, fill="#15171a", stipple="gray25",
+                 outline="#41474f"):
+            # smooth rounded-rectangle polygon (stipple => low-opacity card)
+            pts = [x1+r, y1, x2-r, y1, x2, y1, x2, y1+r,
+                   x2, y2-r, x2, y2, x2-r, y2, x1+r, y2,
+                   x1, y2, x1, y2-r, x1, y1+r, x1, y1]
+            self.settings_items.append(
+                self.canvas.create_polygon(
+                    pts, smooth=True, fill=fill, stipple=stipple,
+                    outline=outline, width=2))
+
+        def lbl(text, x, y, fg="#e6e6e6", size=12, bold=False):
+            place(tk.Label(self.win, text=text, fg=fg, bg=C,
+                           font=tkfont.Font(size=size,
+                                            weight="bold" if bold else "normal")),
+                  x, y)
+
+        def hdr(text, x, y):
+            lbl(text, x, y, fg="#ffffff", size=13, bold=True)
+
+        def btn(text, cmd, x, y, w=14):
+            place(tk.Button(self.win, text=text, command=cmd, width=w,
+                            bd=0, relief="flat", bg="#2a2a2a", fg="#ffffff",
+                            activebackground="#3a3a3a", activeforeground="#ffffff",
+                            pady=5), x, y)
+
+        def scale(var, lo, hi):
+            return tk.Scale(self.win, from_=lo, to=hi, orient="horizontal",
+                            variable=var, showvalue=True, length=150, bg=C,
+                            fg="#ffffff", troughcolor="#2a2a2a",
+                            activebackground="#1ed760", highlightthickness=0,
+                            bd=0)
+
+        def swtch(color):
+            return tk.Canvas(self.win, width=26, height=20, bg=color,
+                             highlightthickness=1, highlightbackground="#555555")
+
+        # ---------- POSITION card ---------- #
+        card(100, 150, 570, 262)
+        hdr("POSITION", 145, 188)
+        self.position_label = tk.Label(self.win, text="", fg="#cfcfcf",
+                                       bg=C, font=tkfont.Font(size=12))
+        place(self.position_label, 145, 220)
+        btn("Choose on monitor", self._show_position_page, 320, 219, w=17)
+
+        # ---------- APPEARANCE card ---------- #
+        card(100, 298, 570, 595)
+        hdr("APPEARANCE", 145, 334)
+        y = 378
+        self.bg_swatch = swtch(self.config["bg_color"])
+        lbl("Background", 145, y)
+        place(self.bg_swatch, 145 + 125, y)
+        btn("Pick", lambda: self._pick_color("bg_color", self.bg_swatch),
+            145 + 175, y, w=7)
+        y += 46
+        self.fg_swatch = swtch(self.config["font_color"])
+        lbl("Font", 145, y)
+        place(self.fg_swatch, 145 + 125, y)
+        btn("Pick", lambda: self._pick_color("font_color", self.fg_swatch),
+            145 + 175, y, w=7)
+        y += 46
         self.opacity_var = tk.IntVar(value=int(self.config["opacity"] * 100))
-        self._add_scaled_row(panel, "Opacity", self.opacity_var, 20, 100, " %")
-
-        self._add_section(panel, "OVERLAY")
+        lbl("Opacity", 145, y)
+        place(scale(self.opacity_var, 20, 100), 145 + 125, y)
+        y += 46
         self.size_var = tk.IntVar(value=self.config["size"])
-        self._add_scaled_row(panel, "Size", self.size_var, 120, 260, " px")
+        lbl("Size", 145, y)
+        place(scale(self.size_var, 120, 260), 145 + 125, y)
+        y += 46
         self.words_var = tk.IntVar(value=self.config.get("max_words", 5))
-        self._add_scaled_row(panel, "Title words", self.words_var, 2, 8, "")
+        lbl("Title words", 145, y)
+        place(scale(self.words_var, 2, 8), 145 + 125, y)
 
-        self._add_section(panel, "HOTKEYS")
+        # ---------- HOTKEYS card ---------- #
+        card(720, 150, 1140, 470)
+        hdr("HOTKEYS", 765, 188)
         self.hot_show = tk.StringVar(value=self.config["hotkey_show"])
         self.hot_overlay = tk.StringVar(value=self.config["hotkey_overlay"])
         self.hot_next = tk.StringVar(value=self.config["hotkey_next"])
         self.hot_prev = tk.StringVar(value=self.config["hotkey_prev"])
-        hotkey_btn = tk.Button(
-            panel, text="Edit Hotkeys", width=22, bd=0, relief="flat",
-            bg="#2a2a2a", fg="#ffffff", activebackground="#3a3a3a",
-            activeforeground="#ffffff", font=tkfont.Font(size=9),
-            command=self._open_hotkeys_popup,
-        )
-        hotkey_btn.grid(row=self._next_row(), column=0, columnspan=3,
-                        sticky="w", padx=12, pady=3)
-
-        self.ok_img = ImageTk.PhotoImage(
-            Image.open(resource_path("ok.png")).resize((120, 30)))
-        ok_btn = tk.Button(panel, image=self.ok_img, bd=0, relief="flat",
-                           command=self._confirm, activebackground="#ff0000")
-        ok_btn.image = self.ok_img
-        ok_btn.grid(row=self._next_row(), column=0, columnspan=3,
-                    padx=12, pady=(8, 10))
+        hy = 245
+        for lab, var in (("Show / Hide", self.hot_show),
+                         ("Click-through", self.hot_overlay),
+                         ("Next track", self.hot_next),
+                         ("Prev track", self.hot_prev)):
+            lbl(lab, 765, hy)
+            place(tk.Entry(self.win, textvariable=var, width=16, bg="#2a2a2a",
+                           fg="#ffffff", insertbackground="#ffffff",
+                           relief="flat", font=tkfont.Font(size=12)),
+                  765 + 150, hy)
+            hy += 55
 
         self._refresh_position_label()
 
-    def _next_row(self):
-        r = self._panel_row
-        self._panel_row += 1
-        return r
-
-    def _add_section(self, panel, title):
-        tk.Label(panel, text=title, fg="#1ed760", bg="#1b1b1b",
-                 font=tkfont.Font(size=9, weight="bold")
-                 ).grid(row=self._next_row(), column=0, columnspan=3,
-                        sticky="w", padx=12, pady=(5, 1))
-    def _add_color_row(self, panel, label, swatch, on_pick):
-        row = self._next_row()
-        tk.Label(panel, text=label, fg="#e6e6e6", bg="#1b1b1b", width=14,
-                 anchor="w", font=tkfont.Font(size=9),
-                 ).grid(row=row, column=0, sticky="w", padx=(12, 4), pady=1)
-        swatch.grid(row=row, column=1, sticky="w", padx=4, pady=1)
-        tk.Button(panel, text="Choose...", width=8, bd=0, relief="flat",
-                  bg="#2a2a2a", fg="#ffffff", activebackground="#3a3a3a",
-                  activeforeground="#ffffff", command=on_pick,
-                  ).grid(row=row, column=2, sticky="w", padx=(0, 10), pady=1)
-
-    def _add_scaled_row(self, panel, label, var, from_, to, suffix):
-        row = self._next_row()
-        inner = tk.Frame(panel, bg="#1b1b1b")
-        tk.Label(inner, text=label, fg="#e6e6e6", bg="#1b1b1b",
-                 font=tkfont.Font(size=9)).pack(side="left")
-        tk.Scale(inner, from_=from_, to=to, orient="horizontal", variable=var,
-                 showvalue=True, length=88, bg="#1b1b1b", fg="#ffffff",
-                 troughcolor="#2a2a2a", activebackground="#1ed760",
-                 highlightthickness=0, bd=0).pack(side="left", padx=(5, 0))
-        if suffix:
-            tk.Label(inner, text=suffix, fg="#9a9a9a", bg="#1b1b1b",
-                     font=tkfont.Font(size=9)).pack(side="left")
-        inner.grid(row=row, column=0, columnspan=3, sticky="w", padx=12, pady=1)
+        # ---------- OK (centered bottom) ---------- #
+        card(self.WIDTH // 2 - 110, 610, self.WIDTH // 2 + 110, 665, r=14)
+        place(tk.Button(self.win, text="OK", bd=0, relief="flat", width=16,
+                        fg="#08130c", bg="#1ed760", activeforeground="#ffffff",
+                        activebackground="#17b54f",
+                        font=tkfont.Font(size=16, weight="bold"), pady=7,
+                        command=self._confirm),
+              self.WIDTH // 2, 632, anchor="center")
 
     def _refresh_position_label(self):
         try:
@@ -585,46 +630,6 @@ class SettingsWindow:
         })
         self.win.destroy()
         self.on_confirm(self.config)
-    def _open_hotkeys_popup(self):
-        """Open a compact child dialog to edit the hotkey fields."""
-        popup = tk.Toplevel(self.win)
-        popup.title("Hotkeys")
-        popup.configure(bg="#1b1b1b")
-        popup.overrideredirect(True)
-        popup.attributes("-topmost", True)
-
-        label_info = tk.Label(
-            popup, text="Hotkeys", fg="#d71e1e", bg="#1b1b1b",
-            font=tkfont.Font(size=12, weight="bold"))
-        label_info.grid(row=0, column=0, columnspan=2, sticky="w",
-                        padx=14, pady=(12, 4))
-
-        def row(r, text, var):
-            tk.Label(popup, text=text, fg="#e6e6e6", bg="#1b1b1b", width=14,
-                     anchor="w", font=tkfont.Font(size=9)
-                     ).grid(row=r, column=0, sticky="w", padx=(14, 6), pady=3)
-            tk.Entry(popup, textvariable=var, width=16, bg="#2a2a2a",
-                     fg="#ffffff", insertbackground="#ffffff", relief="flat"
-                     ).grid(row=r, column=1, sticky="w", padx=(0, 14), pady=3)
-
-        row(1, "Show / Hide", self.hot_show)
-        row(2, "Overlay", self.hot_overlay)
-        row(3, "Next track", self.hot_next)
-        row(4, "Prev track", self.hot_prev)
-
-        bot = tk.Frame(popup, bg="#1b1b1b")
-        bot.grid(row=5, column=0, columnspan=2, sticky="e", padx=14, pady=(8, 12))
-        tk.Button(bot, text="Done", width=8, bd=0, relief="flat", bg="#d71e1e",
-                  fg="#ffffff", activebackground="#b31212",
-                  activeforeground="#ffffff", command=popup.destroy,
-                  ).pack()
-
-        popup.update_idletasks()
-        w = popup.winfo_reqwidth()
-        h = popup.winfo_reqheight()
-        x = self.win.winfo_x() + (self.win.winfo_width() - w) // 2
-        y = self.win.winfo_y() + (self.win.winfo_height() - h) // 2
-        popup.geometry(f"{w}x{h}+{x}+{y}")
 # -- small top-right close button ------------------------------------ #
     def _build_close_button(self):
         close_btn = tk.Button(
@@ -652,7 +657,7 @@ class SpotiApp:
         "size": 160,
         "max_words": 5,
         "hotkey_show": "alt+h",
-        "hotkey_overlay": "alt+o",
+        "hotkey_overlay": "",
         "hotkey_next": "alt+right",
         "hotkey_prev": "alt+left",
         "refresh_ms": 3000,
@@ -672,6 +677,7 @@ class SpotiApp:
 
     def on_confirm(self, config):
         self.config = config
+        # overlay always re-anchors to its chosen corner (recomputed for size)
         self.overlay = Overlay(self.root, self.config, self.show_settings)
 
 
