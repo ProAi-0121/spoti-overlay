@@ -21,6 +21,9 @@ The overlay stays on top of your other windows, is configurable in position, col
 - Main OVERLAY
 <img width="2461" height="1439" alt="image" src="https://github.com/user-attachments/assets/e15f84f6-d645-45f6-8a5d-8b6db3f677b1" />
 
+- Right-Click On Overlay
+<img width="720" height="510" alt="image" src="https://github.com/user-attachments/assets/dd6fb791-6743-473d-b1f7-52b97a590062" />
+
 
 ## Features
 
