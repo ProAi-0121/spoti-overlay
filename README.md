@@ -9,12 +9,23 @@ Built with Python, **PyQt5**, and **Spotipy**.
 ## Description
 
 Spoti Overlay is a lightweight Windows desktop widget that mirrors the now-playing info from your Spotify account using the Spotify Web API. It solves the problem of having to switch windows or check the Spotify title bar just to see what song is playing.
-
 The overlay stays on top of your other windows, is configurable in position, colors, and opacity, and responds to global hotkeys and mouse clicks so you can control playback without leaving your current screen.
+
+## IMAGES
+- Settings/Home Page
+<img width="1462" height="955" alt="image" src="https://github.com/user-attachments/assets/0ca2d332-a4b4-465a-ae81-6627d555d9ed" />
+
+- Position Choosing
+<img width="1338" height="850" alt="image" src="https://github.com/user-attachments/assets/8930dfea-3d1a-464d-bc51-bbb7a67b64cf" />
+
+- Main OVERLAY
+<img width="2461" height="1439" alt="image" src="https://github.com/user-attachments/assets/e15f84f6-d645-45f6-8a5d-8b6db3f677b1" />
+
 
 ## Features
 
 - ⬆️ **Always-on-top, frameless overlay** that stays visible while you work or play
+
 - 🎵 Displays the **current track, artist, and album artwork**
 - 🖱️ **Left-click** the album art to toggle play / pause
 - 📋 **Right-click** menu with Next Track, Previous Track, Overlay toggle, and Settings
