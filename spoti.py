@@ -176,7 +176,7 @@ class Overlay:
         elif pos == "Bottom Left":
             x, y = 2, sh - h - 97
         elif pos == "Bottom Right":
-            x, y = sw - w + 35, sh - h - 97
+            x, y = sw - w + 35, sh - h - 150
         else:  # Top Left (default)
             x, y = 2, 2
         self.win.geometry(f"+{x}+{y}")
@@ -375,8 +375,9 @@ class SettingsWindow:
         self.canvas.bind("<ButtonRelease-1>", self._stop_move)
         self.canvas.bind("<B1-Motion>", self._on_motion)
 
-        # chosen position is shared with the position popup
+        # chosen position is shared with the position page
         self.position_var = tk.StringVar(value=self.config["position"])
+        self.pos_page = None
         self._build_options_panel()
         self._build_close_button()
 
@@ -394,42 +395,47 @@ class SettingsWindow:
         ox, oy = self._drag_offset
         self.win.geometry(f"+{event.x_root - ox}+{event.y_root - oy}")
 
-    # -- position selection popup ---------------------------------------- #
-    def _open_position_popup(self):
-        monitor = Image.open(resource_path("monitor.png"))
-        mw, mh = monitor.size
-        target_w = 760
-        scale = target_w / mw
-        pw, ph = int(mw * scale), int(mh * scale)
-        monitor_img = monitor.resize((pw, ph))
+    # -- settings / position page switching --------------------------------- #
+    def _show_settings_page(self):
+        if self.pos_page is not None:
+            self.pos_page.place_forget()
+        self.canvas.itemconfigure(self.panel_win_id, state="normal")
+        self.canvas.itemconfigure(self.close_win_id, state="normal")
+        self.canvas.tag_raise(self.panel_win_id)
 
-        popup = tk.Toplevel(self.win)
-        popup.title("Choose Position")
-        popup.transient(self.win)
-        popup.attributes("-topmost", True)
-        popup.overrideredirect(True)
+    def _show_position_page(self):
+        self.canvas.itemconfigure(self.panel_win_id, state="hidden")
+        self.canvas.itemconfigure(self.close_win_id, state="hidden")
+        if self.pos_page is None:
+            self._build_position_page()
+        self.pos_page.place(x=0, y=0, relwidth=1, relheight=1)
 
-        self._mon = ImageTk.PhotoImage(monitor_img)
-        cv = tk.Canvas(popup, width=pw, height=ph, highlightthickness=0)
-        cv.pack()
+    def _build_position_page(self):
+        page = tk.Frame(self.win, bg="#000000")
+        monitor = Image.open(resource_path("monitor.png")).resize(
+            (self.WIDTH, self.HEIGHT))
+        self._mon = ImageTk.PhotoImage(monitor)
+        cv = tk.Canvas(page, width=self.WIDTH, height=self.HEIGHT,
+                       highlightthickness=0)
+        cv.pack(fill="both", expand=True)
         cv.create_image(0, 0, anchor="nw", image=self._mon)
 
         btn_w, btn_h = 46, 65
         self._pb_img = ImageTk.PhotoImage(
             Image.open(resource_path("example.png")).resize((btn_w, btn_h)))
-        margin = 14
+        m = 14
         corners = [
-            ("Top Left", margin, margin),
-            ("Top Right", pw - btn_w - margin, margin),
-            ("Bottom Left", margin, ph - btn_h - margin),
-            ("Bottom Right", pw - btn_w - margin, ph - btn_h - margin),
+            ("Top Left", m, m),
+            ("Top Right", self.WIDTH - btn_w - m, m),
+            ("Bottom Left", m, self.HEIGHT - btn_h - m - 18),
+            ("Bottom Right", self.WIDTH - btn_w - m, self.HEIGHT - btn_h - m - 18),
         ]
         selected = self.position_var.get()
         for name, x, y in corners:
             b = tk.Button(
-                popup, image=self._pb_img, bd=0, relief="flat",
+                page, image=self._pb_img, bd=0, relief="flat",
                 activebackground="#222222",
-                command=lambda n=name: self._pick_position(n, popup),
+                command=lambda n=name: self._pick_position(n),
             )
             cv.create_window(x, y, anchor="nw", window=b)
             if name == selected:
@@ -437,24 +443,25 @@ class SettingsWindow:
                     x - 5, y - 5, x + btn_w + 5, y + btn_h + 5,
                     outline="#d71e1e", width=3)
 
-        popup.update_idletasks()
-        px = self.win.winfo_x() + (self.win.winfo_width() - pw) // 2
-        py = self.win.winfo_y() + (self.win.winfo_height() - ph) // 2
-        popup.geometry(f"{pw}x{ph}+{px}+{py}")
+        back = tk.Button(
+            page, text="Back", bd=0, relief="flat", width=8,
+            bg="#2a2a2a", fg="#ffffff", activebackground="#3a3a3a",
+            activeforeground="#ffffff", command=self._show_settings_page)
+        cv.create_window(
+            self.WIDTH // 2 - 2, self.HEIGHT - 24, anchor="s", window=back)
 
-        # modal: block the settings window until the popup is closed
-        popup.grab_set()
-        self.win.wait_window(popup)
+        self.pos_page = page
 
-    def _pick_position(self, name, popup):
+    def _pick_position(self, name):
         self.position_var.set(name)
         self._refresh_position_label()
-        popup.destroy()
+        self._show_settings_page()
 # -- options panel (the "added more things") ------------------------- #
     def _build_options_panel(self):
         panel = tk.Frame(self.win, bg="#1b1b1b",
                          highlightthickness=1, highlightbackground="#333333")
-        self.canvas.create_window(700, 150, anchor="nw", window=panel)
+        self.panel_win_id = self.canvas.create_window(700, 150, anchor="nw",
+                                                      window=panel)
         self._panel_row = 0
 
         self.position_label = tk.Label(panel, text="", fg="#9f9f9f",
@@ -465,7 +472,7 @@ class SettingsWindow:
             panel, text="Choose Position...", width=22, bd=0, relief="flat",
             bg="#2a2a2a", fg="#ffffff", activebackground="#3a3a3a",
             activeforeground="#ffffff", font=tkfont.Font(size=9),
-            command=self._open_position_popup,
+            command=self._show_position_page,
         )
         pos_btn.grid(row=self._next_row(), column=0, columnspan=3,
                      sticky="w", padx=12, pady=(0, 4))
@@ -626,7 +633,7 @@ class SettingsWindow:
             activebackground="#ff3b30", activeforeground="#ffffff",
             command=self._cancel,
         )
-        self.canvas.create_window(
+        self.close_win_id = self.canvas.create_window(
             self.WIDTH - 30, 10, anchor="ne", window=close_btn)
 
     def _cancel(self):
