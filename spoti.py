@@ -1,26 +1,3 @@
-"""
-Spoti Overlay v2
-================
-Frameless, always-on-top desktop widget that mirrors whatever media is playing
-(primarily Spotify) using the **Windows Media Session API** (winsdk) -- so no
-Spotify developer credentials are required.
-
-The settings window uses the image-based, frameless tkinter design from
-test.py (bag2.png background + example.png position buttons) and has been
-extended with background/font colors, opacity, overlay size, global hotkeys
-and click-through support.
-
-Controls
---------
-* Left-click the overlay  -> toggle play / pause
-* Right-click the overlay -> context menu (next / previous / overlay / settings)
-* Global hotkeys (defaults, editable in Settings):
-    Alt+H          show / hide the overlay
-    Alt+O          toggle click-through (overlay mode)
-    Alt+Right      next track
-    Alt+Left       previous track
-"""
-
 import asyncio
 import ctypes
 import os
@@ -41,25 +18,16 @@ from winsdk.windows.media.control import (
 )
 from winsdk.windows.storage.streams import Buffer, InputStreamOptions
 
-# --------------------------------------------------------------------------- #
-#  Helpers / asset loading
-# --------------------------------------------------------------------------- #
 def resource_path(name):
-    """Return an absolute path to a bundled asset (works with PyInstaller)."""
     base = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
     return os.path.join(base, name)
 
-# Windows extended window style constants (used for the click-through overlay)
 GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 
 
-# --------------------------------------------------------------------------- #
-#  Windows Media Session API (from Spoti-Wall.py)
-# --------------------------------------------------------------------------- #
 async def _get_media_info_async():
-    """Return now-playing info dict (or None) via the Windows media session."""
     sessions = await MediaManager.request_async()
     current = sessions.get_current_session()
     if not current:
@@ -98,16 +66,12 @@ async def _get_media_info_async():
 
 
 def get_media_info():
-    """Synchronous wrapper around the async media-session lookup."""
     try:
         return asyncio.run(_get_media_info_async())
     except Exception as e:
         print(f"[Spoti] media lookup error: {e}")
         return None
 
-# --------------------------------------------------------------------------- #
-#  Overlay : the always-on-top now-playing widget
-# --------------------------------------------------------------------------- #
 class Overlay:
     def __init__(self, root, config, on_settings):
         self.root = root
@@ -125,7 +89,6 @@ class Overlay:
         threading.Thread(target=self._poll_loop, daemon=True).start()
         self.root.after(100, self._tick)
 
-    # -- UI construction ------------------------------------------------ #
     def _build(self):
         size = self.config["size"]
         text_area = int(size * 0.55)
@@ -163,7 +126,6 @@ class Overlay:
             font=self.artist_font,
         )
 
-        # whole overlay is interactive
         canvas.bind("<Button-1>", self.toggle_play_pause)
         canvas.bind("<Button-3>", self.show_menu)
 
@@ -173,16 +135,15 @@ class Overlay:
         w, h = self._w, self._h
         pos = self.config["position"]
         if pos == "Top Right":
-            x, y = sw - w + 35, 2
+            x, y = sw - w + 10, 2
         elif pos == "Bottom Left":
-            x, y = 2, sh - h - 97
+            x, y = 2, sh - h - 52
         elif pos == "Bottom Right":
-            x, y = sw - w + 35, sh - h - 150
+            x, y = sw - w + 10, sh - h - 52
         else:  # Top Left (default)
             x, y = 2, 2
         self.win.geometry(f"+{x}+{y}")
 
-    # -- media polling (background thread + main-thread tick) ------------ #
     def _poll_loop(self):
         while self.running:
             info = get_media_info()
@@ -241,7 +202,6 @@ class Overlay:
         self.photo = None
 
     def _fit_text(self, text, font, max_width, max_words, max_chars):
-        """Truncate a string to a word limit that also fits in max_width px."""
         ellipsis = "..."
         text = (text or "").strip()
         if not text:
@@ -250,14 +210,12 @@ class Overlay:
         truncated = len(words) > max_words
         if truncated:
             text = " ".join(words[:max_words])
-        # shrink character-by-character until it fits (with ellipsis shown)
         while font.measure(text + (ellipsis if truncated else "")) > max_width:
             if not text:
                 break
             text = text[:-1].rstrip()
             truncated = True
         out = text + (ellipsis if truncated else "")
-        # hard safety cap
         if len(out) > max_chars:
             out = out[:max_chars].rstrip() + ellipsis
         return out
@@ -289,11 +247,9 @@ class Overlay:
         self._set_layered(self.click_through)
 
     def toggle_borderless(self):
-        """Turn the window's OS frame/border on or off (default: frameless)."""
         self.borderless = not self.borderless
         self.win.overrideredirect(self.borderless)
         self.win.update_idletasks()
-        # re-map so the border change takes effect on Windows
         self.win.withdraw()
         self.win.deiconify()
         self.win.attributes("-topmost", True)
@@ -308,7 +264,6 @@ class Overlay:
             style &= ~(WS_EX_LAYERED | WS_EX_TRANSPARENT)
         ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
 
-    # -- context menu ---------------------------------------------------- #
     def show_menu(self, event):
         menu = tk.Menu(self.win, tearoff=0)
         menu.add_command(label="Next Track", command=self.next_track)
@@ -323,9 +278,7 @@ class Overlay:
         finally:
             menu.grab_release()
 
-    # -- hotkeys --------------------------------------------------------- #
     def _bind(self, hotkey, cb):
-        """Register a hotkey, ignoring any that the keyboard lib can't parse."""
         if hotkey:
             try:
                 keyboard.add_hotkey(hotkey, cb)
@@ -351,9 +304,7 @@ class Overlay:
             self.win.destroy()
         except Exception:
             pass
-# --------------------------------------------------------------------------- #
-#  SettingsWindow : frameless, image-based configuration UI (test.py style)
-# --------------------------------------------------------------------------- #
+
 class SettingsWindow:
     WIDTH, HEIGHT = 1200, 700
 
@@ -381,7 +332,6 @@ class SettingsWindow:
         self.canvas.pack()
         self.canvas.create_image(0, 0, anchor="nw", image=self.bg)
 
-        # top-center title
         self.canvas.create_text(
             self.WIDTH // 2 + 1, 40, text="S P O T I", anchor="n",
             fill="#89EC7C", font=tkfont.Font(size=26, weight="bold"))
@@ -389,20 +339,17 @@ class SettingsWindow:
             self.WIDTH // 2, 37, text="S P O T I", anchor="n",
             fill="#1ed760", font=tkfont.Font(size=26, weight="bold"))
 
-        # draggable window (test.py behaviour) -- only on the empty canvas
         self._drag_offset = None
         self.canvas.bind("<ButtonPress-1>", self._start_move)
         self.canvas.bind("<ButtonRelease-1>", self._stop_move)
         self.canvas.bind("<B1-Motion>", self._on_motion)
 
-        # chosen position is shared with the position page
         self.position_var = tk.StringVar(value=self.config["position"])
         self.pos_page = None
         self.settings_items = []
         self._build_options_panel()
         self._build_close_button()
 
-    # -- window dragging ------------------------------------------------- #
     def _start_move(self, event):
         self._drag_offset = (event.x_root - self.win.winfo_x(),
                              event.y_root - self.win.winfo_y())
@@ -416,7 +363,6 @@ class SettingsWindow:
         ox, oy = self._drag_offset
         self.win.geometry(f"+{event.x_root - ox}+{event.y_root - oy}")
 
-    # -- settings / position page switching --------------------------------- #
     def _set_settings_visible(self, visible):
         state = "normal" if visible else "hidden"
         for iid in self.settings_items:
@@ -445,7 +391,6 @@ class SettingsWindow:
         cv.pack(fill="both", expand=True)
         cv.create_image(0, 0, anchor="nw", image=self._mon)
 
-        # top-center title
         cv.create_text(
             self.WIDTH // 2 + 1, 41, text="CHOOSE POSITION", anchor="n",
             fill="#000000", font=tkfont.Font(size=24, weight="bold"))
@@ -491,8 +436,6 @@ class SettingsWindow:
         self.position_var.set(name)
         self._refresh_position_label()
         self._show_settings_page()
-    # -- options panel (controls placed straight on the background) ---------- #
-    # -- options panel: low-opacity rounded category cards ---------------- #
     def _build_options_panel(self):
         C = "#1a1a1a"
 
@@ -502,7 +445,6 @@ class SettingsWindow:
 
         def card(x1, y1, x2, y2, r=20, fill="#15171a", stipple="gray25",
                  outline="#41474f"):
-            # smooth rounded-rectangle polygon (stipple => low-opacity card)
             pts = [x1+r, y1, x2-r, y1, x2, y1, x2, y1+r,
                    x2, y2-r, x2, y2, x2-r, y2, x1+r, y2,
                    x1, y2, x1, y2-r, x1, y1+r, x1, y1]
@@ -537,7 +479,6 @@ class SettingsWindow:
             return tk.Canvas(self.win, width=26, height=20, bg=color,
                              highlightthickness=1, highlightbackground="#555555")
 
-        # ---------- POSITION card ---------- #
         card(100, 150, 570, 262)
         hdr("POSITION", 145, 188)
         self.position_label = tk.Label(self.win, text="", fg="#cfcfcf",
@@ -545,7 +486,6 @@ class SettingsWindow:
         place(self.position_label, 145, 220)
         btn("Choose on monitor", self._show_position_page, 320, 219, w=17)
 
-        # ---------- APPEARANCE card ---------- #
         card(100, 298, 570, 595)
         hdr("APPEARANCE", 145, 334)
         y = 378
@@ -573,7 +513,6 @@ class SettingsWindow:
         lbl("Title words", 145, y)
         place(scale(self.words_var, 2, 8), 145 + 125, y)
 
-        # ---------- HOTKEYS card ---------- #
         card(720, 150, 1140, 470)
         hdr("HOTKEYS", 765, 188)
         self.hot_show = tk.StringVar(value=self.config["hotkey_show"])
@@ -594,7 +533,6 @@ class SettingsWindow:
 
         self._refresh_position_label()
 
-        # ---------- OK (centered bottom) ---------- #
         card(self.WIDTH // 2 - 110, 610, self.WIDTH // 2 + 110, 665, r=14)
         place(tk.Button(self.win, text="OK", bd=0, relief="flat", width=16,
                         fg="#08130c", bg="#1ed760", activeforeground="#ffffff",
@@ -630,7 +568,6 @@ class SettingsWindow:
         })
         self.win.destroy()
         self.on_confirm(self.config)
-# -- small top-right close button ------------------------------------ #
     def _build_close_button(self):
         close_btn = tk.Button(
             self.win, text="x", fg="#ffffff", bg="#161616", bd=0,
@@ -645,9 +582,6 @@ class SettingsWindow:
         self.win.destroy()
 
 
-# --------------------------------------------------------------------------- #
-#  Controller : ties the settings window and the overlay together
-# --------------------------------------------------------------------------- #
 class SpotiApp:
     DEFAULT_CONFIG = {
         "position": "Top Left",
@@ -677,7 +611,6 @@ class SpotiApp:
 
     def on_confirm(self, config):
         self.config = config
-        # overlay always re-anchors to its chosen corner (recomputed for size)
         self.overlay = Overlay(self.root, self.config, self.show_settings)
 
 
