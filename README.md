@@ -1,14 +1,14 @@
 # 🎵 Spoti Overlay
 
-An always-on-top, frameless desktop overlay that shows the **currently playing Spotify track**, artist, and album art — right on top of whatever you're doing.
+An always-on-top desktop overlay that shows the **currently playing media** (Spotify, YouTube, browsers, games, etc.), artist, and album art — right on top of whatever you're doing.
 
-Built with Python, **PyQt5**, and **Spotipy**.
+Built with Python and **tkinter**, using the **Windows Media Session API** (`winsdk`). No Spotify account or API keys required.
 
 ---
 
 ## Description
 
-Spoti Overlay is a lightweight Windows desktop widget that mirrors the now-playing info from your Spotify account using the Spotify Web API. It solves the problem of having to switch windows or check the Spotify title bar just to see what song is playing.
+Spoti Overlay is a lightweight Windows desktop widget that mirrors whatever is currently playing on your system using the **Windows Media Session API**. It solves the problem of having to switch windows or check the app title bar just to see what song is playing — and it works with **any** media app (Spotify, YouTube, etc.), no authentication needed.
 The overlay stays on top of your other windows, is configurable in position, colors, and opacity, and responds to global hotkeys and mouse clicks so you can control playback without leaving your current screen.
 
 ## IMAGES
@@ -27,26 +27,26 @@ The overlay stays on top of your other windows, is configurable in position, col
 
 ## Features
 
-- ⬆️ **Always-on-top, frameless overlay** that stays visible while you work or play
-
-- 🎵 Displays the **current track, artist, and album artwork**
+- ⬆️ **Always-on-top overlay** that stays visible while you work or play (borderless/frameless by default)
+- 🎵 Shows the **current track, artist, and album artwork** from any app via the **Windows Media Session API** — no Spotify login
 - 🖱️ **Left-click** the album art to toggle play / pause
-- 📋 **Right-click** menu with Next Track, Previous Track, Overlay toggle, and Settings
-- 🎨 Configurable **position** (top-left, top-right, bottom-left, bottom-right)
-- 🎨 Configurable **background color, font color, and opacity**
-- ⌨️ Global hotkeys:
+- 📋 **Right-click** menu with Next Track, Previous Track, Overlay Mode, and Settings
+  - **Overlay Mode** toggles the window border on/off (move it by the title bar when bordered)
+- 🖥️ **Position picker** on a monitor image — click a corner to place the overlay (top-left, top-right, bottom-left, bottom-right)
+- 🎴 **Settings window** organized into low-opacity, rounded category cards (POSITION, APPEARANCE, HOTKEYS)
+- 🎨 Configurable **background color, font color, opacity, and overlay size**
+- ⌨️ Global hotkeys (editable in Settings):
   - `Alt+H` — show / hide the overlay
   - `Alt+Right` — next track
   - `Alt+Left` — previous track
-- 🔁 Auto-refreshes the now-playing info every 5 seconds
+  - **Click-through hotkey** — optional, disabled by default; toggles mouse click-through
+- 🔁 Auto-refreshes the now-playing info every few seconds
 - 🧱 Packageable as a Windows `.exe` with PyInstaller (`spoti.spec`)
 
 ## Requirements
 
-- **OS:** Windows (playback control uses system/global media keys)
+- **OS:** Windows (reads system media info via the Media Session API; playback control uses global media keys)
 - **Python:** 3.8+ (developed on 3.11)
-- **A Spotify account** (Premium is required for Spotify playback-control scopes)
-- **A Spotify Developer app** for API credentials — free at <https://developer.spotify.com/dashboard>
 
 Python dependencies (see `requirements.txt`):
 
@@ -72,31 +72,14 @@ pip install -r requirements.txt
 
 ## Configuration
 
-1. Create a Spotify app at <https://developer.spotify.com/dashboard> and add `http://localhost:8888/callback` as a **Redirect URI**.
-2. Copy the example environment file and fill in your credentials:
+Everything is configured in-app — you don't need any API keys or environment variables.
 
-```bash
-copy .env.example .env         # Windows
-```
+1. On the **Settings** window, choose where the overlay sits with **POSITION → Choose on monitor**, then click a corner.
+2. Under **APPEARANCE** adjust the background color, font color, opacity, and overlay size.
+3. Under **HOTKEYS** set your shortcuts (Show/Hide, Click-through, Next track, Prev track).
+4. Click **OK** and the overlay appears.
 
-3. Edit `.env` and set your Spotify app's Client ID and Client Secret:
-
-```
-SPOTIPY_CLIENT_ID=your_client_id_here
-SPOTIPY_CLIENT_SECRET=your_client_secret_here
-SPOTIPY_REDIRECT_URI=http://localhost:8888/callback
-```
-
-> ⚠️ **Never commit `.env`.** It is already listed in `.gitignore`. The first launch opens a browser to authorize the app with Spotify.
-
-### Environment variables
-
-| Variable | Required | Description |
-| --- | --- | --- |
-| `SPOTIPY_CLIENT_ID` | ✅ | Spotify app client ID |
-| `SPOTIPY_CLIENT_SECRET` | ✅ | Spotify app client secret |
-| `SPOTIPY_REDIRECT_URI` | ✅ | Must match the Redirect URI in your Spotify app |
-| `SPOTIFY_SCOPE` | Optional | Space-separated OAuth scopes (a sensible default is provided) |
+> 💡 Long song titles are automatically cut off with an ellipsis so they never overflow the box. You can adjust how many words are shown with the *Title words* slider.
 
 ## Usage
 
@@ -106,9 +89,7 @@ Run the app:
 python spoti.py
 ```
 
-A settings dialog appears first so you can choose the overlay position, colors, and opacity. Confirm it and the overlay appears. Authorize Spotify in the browser window that opens on first run.
-
-The first time you authorize, Spotify saves a `.cache-{username}` file locally (this is your token — keep it private and do not commit it).
+The settings window opens first so you can pick a position, colors, opacity, size, and hotkeys. Confirm it and the overlay appears — there is no login or OAuth step.
 
 ### Build a stand-alone Windows executable
 
@@ -125,31 +106,30 @@ spoti-overlay/
 ├── spoti.py          # Main application (entry point)
 ├── spoti.spec        # PyInstaller build configuration
 ├── requirements.txt  # Python dependencies
-├── .env.example      # Example environment configuration
 ├── .gitignore
 ├── icon.ico          # Application icon
-├── bag.png           # UI asset
+├── bag.png           # UI asset (settings background)
 ├── bag2.png          # UI asset
-├── example.png       # UI asset
+├── example.png       # UI asset (position button icon)
+├── monitor.png       # UI asset (position-picker monitor image)
 ├── ok.png            # UI asset
 ├── screen.png        # UI asset
-├── top_left_image.png# UI asset
-└── test.py           # Earlier standalone tkinter prototype
+└── top_left_image.png# UI asset
 ```
 
 ## Troubleshooting
 
-**"Application error" / browser doesn't open on first run**
-Make sure `SPOTIPY_CLIENT_ID`, `SPOTIPY_CLIENT_SECRET`, and `SPOTIPY_REDIRECT_URI` are set in `.env`, and that the Redirect URI exactly matches the one configured in your Spotify Developer app.
+**Nothing is shown on the overlay**
+Make sure something is currently playing (in any app — Spotify, YouTube, a browser, etc.). If the media session is closed or paused, the overlay may show "No song playing".
 
 **Play control (play/pause/next) doesn't work**
-Playback-modification scopes work best with a Spotify **Premium** account. Also confirm media keys aren't intercepted by another app.
+Confirm the global media keys aren't intercepted by another app (e.g. a laptop with a media-key Fn overlay or another media controller).
 
 **The overlay stays in the way**
-Use the right-click menu → **Overlay** to toggle it, or press `Alt+H` to hide/show it.
+Right-click the overlay → **Overlay Mode** to turn on the window border so you can move it by the title bar, or press `Alt+H` to hide/show it.
 
-**HTTP redirect / localhost permission prompt isn't accepted**
-Use a plain `http://localhost:8888/callback` as shown. If the port is busy, update both the Spotify app and `SPOTIPY_REDIRECT_URI`.
+**A hotkey doesn't do anything**
+Hotkeys are validated and unparseable ones are skipped (and printed to the console). Make sure no other app has reserved that shortcut.
 
 ## License
 
